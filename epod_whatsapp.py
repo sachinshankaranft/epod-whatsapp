@@ -91,8 +91,22 @@ STRINGS_EN = {
     "ask_photo": ("✅ Language set to English.\n\n"
                   "📷 Now please send a *photo of the signed POD / waybill*.\n"
                   "Tap the 📎 attach icon below and take or upload a clear photo of the full document."),
+    "ask_waybill": ("✅ Language set to English.\n\n"
+                    "Please type the *LR / Waybill number* for this delivery (the 12-digit number on the document, e.g. 6007 0471 8894)."),
+    "not_found": ("❌ No open delivery found for that number. Please check the waybill and type it again."),
     "reading": "⏳ Reading your document, please wait…",
 }
+
+
+def confirm_message_en(journey):
+    val = ("₹%s" % format(journey["total_invoice_value"], ",")) if journey.get("total_invoice_value") else "-"
+    return ("✅ *Delivery found:*\n\n"
+            f"Waybill: *{journey['waybill_number']}*\n"
+            f"Consignor: {journey['consignor_name']}\n"
+            f"Consignee: {journey['consignee_name']}\n"
+            f"Transporter: {journey['transporter_name']}\n"
+            f"Invoice Value: {val}\n\n"
+            "If this is correct, please *send the POD photo* now. 📷")
 
 # per-driver state: {phone: {"lang": "1", "lang_name": "English"}}
 SESSIONS: dict[str, dict] = {}
@@ -295,11 +309,11 @@ async def whatsapp(request: Request):
     logstep(f"INBOUND from {sender} | media={num_media} | body={body!r}")
 
     session = SESSIONS.get(sender)
+    has_trigger = sender in TRIGGERED
 
-    # --- Case 1: a photo came in ---
+    # --- A photo came in ---
     if num_media > 0:
         if not session:
-            # no language chosen yet - still process, default English, but nudge
             logstep(f"{sender}: photo before language choice, defaulting English")
             session = {"lang": "1", "lang_name": "English"}
             SESSIONS[sender] = session
@@ -310,22 +324,29 @@ async def whatsapp(request: Request):
             mtype = form.get("MediaContentType0", "image/jpeg")
             image_bytes, ctype = download_twilio_media(media_url)
             ocr = extract_with_openai(image_bytes, ctype)
-            # If a gate-in trigger set the journey for this driver, use it directly
-            # (we already know which delivery this is - no waybill guessing needed).
+            # Mapping priority:
+            # 1) gate-in trigger (we already know the journey)
+            # 2) waybill the driver TYPED earlier in this chat (ground truth)
+            # 3) waybill read off the image (cold fallback)
             triggered_journey = TRIGGERED.pop(sender, None)
+            typed_journey = session.get("journey")
             if triggered_journey:
                 journey = triggered_journey
-                logstep(f"MAP: using gate-in triggered journey {journey['journey_fteid']} (confidence-independent)")
+                logstep(f"MAP: gate-in triggered journey {journey['journey_fteid']}")
+            elif typed_journey:
+                journey = typed_journey
+                logstep(f"MAP: driver-typed waybill journey {journey['journey_fteid']}")
             else:
                 journey = find_journey(ocr.get("waybill_number"))
-                logstep(f"MAP: cold photo, matched waybill {ocr.get('waybill_number')} -> {journey['journey_fteid'] if journey else 'NO MATCH'}")
+                logstep(f"MAP: cold photo, matched {ocr.get('waybill_number')} -> {journey['journey_fteid'] if journey else 'NO MATCH'}")
             result = run_engine(ocr, journey)
             debit = eval_debit(result["shortage"]["items"], journey["rate_card"]) if (result["verdict"] == "PENDING_L1" and journey) else None
             msg_en = verdict_message_en(result, journey, debit) if (journey or result["verdict"] != "REJECTED") \
                 else verdict_message_en(result, {"waybill_number": ocr.get("waybill_number")}, None)
             msg = translate(msg_en, lang_name)
             img_b64 = "data:%s;base64,%s" % (ctype, base64.b64encode(image_bytes).decode())
-            entry.update({"waybill": ocr.get("waybill_number"), "verdict": result["verdict"],
+            wb_shown = journey["waybill_number"] if journey else ocr.get("waybill_number")
+            entry.update({"waybill": wb_shown, "verdict": result["verdict"],
                           "journey": journey["journey_fteid"] if journey else None,
                           "consignor": journey["consignor_name"] if journey else "-",
                           "consignee": journey["consignee_name"] if journey else "-",
@@ -335,7 +356,9 @@ async def whatsapp(request: Request):
                           "reason": result["reasons"][0] if result["reasons"] else "",
                           "image": img_b64, "source": "WhatsApp"})
             HISTORY.insert(0, entry)
-            logstep(f"VERDICT: {result['verdict']} for {ocr.get('waybill_number')} -> replying in {lang_name}")
+            session.pop("journey", None)  # clear typed journey after use
+            session["stage"] = "done"
+            logstep(f"VERDICT: {result['verdict']} for {wb_shown} -> replying in {lang_name}")
             return twiml_reply(msg)
         except Exception as e:
             logstep(f"ERROR processing photo: {type(e).__name__}: {e}")
@@ -343,14 +366,32 @@ async def whatsapp(request: Request):
             HISTORY.insert(0, entry)
             return twiml_reply(translate("⚠️ Sorry, I couldn't read that image. Please retake it clearly and send again.", lang_name))
 
-    # --- Case 2: a language choice (1-6) ---
+    # --- A language choice (1-6) ---
     if body in LANGUAGES:
         eng_name, native = LANGUAGES[body]
-        SESSIONS[sender] = {"lang": body, "lang_name": eng_name}
-        logstep(f"{sender}: language set to {eng_name}")
-        return twiml_reply(translate(STRINGS_EN["ask_photo"], eng_name))
+        # if a gate-in trigger is active, we already know the delivery -> ask for photo
+        if has_trigger:
+            SESSIONS[sender] = {"lang": body, "lang_name": eng_name, "stage": "await_photo"}
+            logstep(f"{sender}: language {eng_name}, gate-in active -> ask photo")
+            return twiml_reply(translate(STRINGS_EN["ask_photo"], eng_name))
+        # cold / driver-initiated -> ask for the waybill number
+        SESSIONS[sender] = {"lang": body, "lang_name": eng_name, "stage": "await_waybill"}
+        logstep(f"{sender}: language {eng_name}, cold flow -> ask waybill")
+        return twiml_reply(translate(STRINGS_EN["ask_waybill"], eng_name))
 
-    # --- Case 3: anything else -> show welcome/menu ---
+    # --- Driver is typing the waybill number (cold flow) ---
+    if session and session.get("stage") == "await_waybill":
+        lang_name = session["lang_name"]
+        journey = find_journey(body)
+        if not journey:
+            logstep(f"{sender}: typed waybill {body!r} -> no match")
+            return twiml_reply(translate(STRINGS_EN["not_found"], lang_name))
+        session["journey"] = journey
+        session["stage"] = "await_photo"
+        logstep(f"{sender}: typed waybill matched {journey['journey_fteid']} -> confirm + ask photo")
+        return twiml_reply(translate(confirm_message_en(journey), lang_name))
+
+    # --- Anything else -> welcome/menu ---
     logstep(f"{sender}: showing welcome menu")
     return twiml_reply(WELCOME)
 
