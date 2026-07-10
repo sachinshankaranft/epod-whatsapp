@@ -96,8 +96,15 @@ STRINGS_EN = {
 
 # per-driver state: {phone: {"lang": "1", "lang_name": "English"}}
 SESSIONS: dict[str, dict] = {}
+# gate-in triggers: {phone: journey_dict} - set when a gate-in fires, so the
+# NEXT photo from that driver maps straight to this journey (no waybill guessing)
+TRIGGERED: dict[str, dict] = {}
 # processed POD history for the dashboard
 HISTORY: list[dict] = []
+
+# the driver's WhatsApp number for the demo (gate-in messages send here)
+DRIVER_NUMBER = os.environ.get("DRIVER_NUMBER", "whatsapp:+919110844592")
+TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
 
 
 def norm(v):
@@ -153,10 +160,17 @@ def _openai_key():
 
 
 VISION_PROMPT = """Validate this POD / Safexpress waybill. Return ONLY JSON:
-{"waybill_number": string|null, "legible": boolean, "illegible_fields": string[], "damage_or_shortage": boolean, "damage_notes": string[], "shortage_items": [{"material_code": string, "shortage_qty": number}], "signature_present": boolean, "stamp_present": boolean}
-Legibility: only critical fields matter (waybill number, signature/stamp/damage region). Minor fields (DIM, weight, dates) never count. Normal phone blur is fine.
-The waybill number is the long number near the top right (also in the barcode), format like "5007 0496 2299".
-damage_or_shortage=true only if there's a handwritten/printed note of damage, breakage, shortage, or missing quantity. A normal signature+stamp with no such note = false. Use false/null when unsure."""
+{"waybill_number": string|null, "waybill_confidence": number, "legible": boolean, "illegible_fields": string[], "damage_or_shortage": boolean, "damage_notes": string[], "shortage_items": [{"material_code": string, "shortage_qty": number}], "signature_present": boolean, "stamp_present": boolean}
+
+READING THE WAYBILL NUMBER (most important - be careful):
+- It is a 12-digit number formatted as 4-4-4, like "6007 0471 8894".
+- It appears TWICE: (a) in a box near the top labelled "Waybill No.", and (b) as the human-readable digits printed directly UNDER the barcode (top right). The digits under the barcode are usually the cleanest, machine-printed copy - prefer those.
+- Read BOTH copies and cross-check them against each other. If they agree, you are confident. If they disagree, pick the barcode digits and lower your confidence.
+- Watch out for 0/6, 4/6, 1/7, 8/3 confusion. Look carefully at each digit.
+- Set "waybill_confidence" 0.0-1.0: use >=0.9 only if both copies clearly agree; 0.5-0.8 if slightly unsure or blurry; <0.5 if you are guessing.
+
+LEGIBILITY: only critical fields matter (waybill number, signature/stamp/damage region). Minor fields (DIM, weight, dates) never count. Normal phone blur is fine.
+DAMAGE/SHORTAGE: damage_or_shortage=true only if there's a handwritten/printed note of damage, breakage, shortage, or missing quantity. A normal signature+stamp with no such note = false. Use false/null when unsure."""
 
 
 def extract_with_openai(image_bytes, mtype):
@@ -172,7 +186,7 @@ def extract_with_openai(image_bytes, mtype):
         res.raise_for_status()
     txt = res.json()["choices"][0]["message"]["content"]
     parsed = json.loads(txt.replace("```json", "").replace("```", "").strip())
-    logstep(f"OCR result: waybill={parsed.get('waybill_number')} damage={parsed.get('damage_or_shortage')} legible={parsed.get('legible')}")
+    logstep(f"OCR result: waybill={parsed.get('waybill_number')} confidence={parsed.get('waybill_confidence')} damage={parsed.get('damage_or_shortage')} legible={parsed.get('legible')}")
     return parsed
 
 
@@ -235,6 +249,37 @@ def twiml_reply(message):
         media_type="application/xml")
 
 
+def send_whatsapp(to, message):
+    """Proactively SEND a WhatsApp message (not a reply) via Twilio REST API.
+    Works in the sandbox as long as the recipient's 24h session window is open."""
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not sid or not token:
+        logstep("SEND ERROR: Twilio credentials not set")
+        return False
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+    logstep(f"SEND: proactive message to {to}")
+    r = requests.post(url, auth=(sid, token),
+                      data={"From": TWILIO_WHATSAPP_FROM, "To": to, "Body": message}, timeout=30)
+    if r.status_code >= 300:
+        logstep(f"SEND ERROR {r.status_code}: {r.text[:300]}")
+        return False
+    logstep(f"SEND OK: {r.status_code}")
+    return True
+
+
+def gatein_message(journey):
+    """Safe, language-neutral gate-in prompt + language menu."""
+    return (
+        f"🚚 *You have reached {journey['consignee_name']}*\n"
+        f"Delivery LR / Waybill: *{journey['waybill_number']}*\n\n"
+        f"Please upload the *signed & stamped POD* for this delivery.\n\n"
+        f"First, choose your language / अपनी भाषा चुनें:\n"
+        f"1. English\n2. हिंदी\n3. தமிழ்\n4. ಕನ್ನಡ\n5. తెలుగు\n6. मराठी\n\n"
+        f"_Reply with a number (1-6), then send the POD photo._"
+    )
+
+
 # ============================================================================
 # App
 # ============================================================================
@@ -265,7 +310,15 @@ async def whatsapp(request: Request):
             mtype = form.get("MediaContentType0", "image/jpeg")
             image_bytes, ctype = download_twilio_media(media_url)
             ocr = extract_with_openai(image_bytes, ctype)
-            journey = find_journey(ocr.get("waybill_number"))
+            # If a gate-in trigger set the journey for this driver, use it directly
+            # (we already know which delivery this is - no waybill guessing needed).
+            triggered_journey = TRIGGERED.pop(sender, None)
+            if triggered_journey:
+                journey = triggered_journey
+                logstep(f"MAP: using gate-in triggered journey {journey['journey_fteid']} (confidence-independent)")
+            else:
+                journey = find_journey(ocr.get("waybill_number"))
+                logstep(f"MAP: cold photo, matched waybill {ocr.get('waybill_number')} -> {journey['journey_fteid'] if journey else 'NO MATCH'}")
             result = run_engine(ocr, journey)
             debit = eval_debit(result["shortage"]["items"], journey["rate_card"]) if (result["verdict"] == "PENDING_L1" and journey) else None
             msg_en = verdict_message_en(result, journey, debit) if (journey or result["verdict"] != "REJECTED") \
@@ -302,6 +355,21 @@ async def whatsapp(request: Request):
     return twiml_reply(WELCOME)
 
 
+@app.post("/gatein/{idx}")
+async def gatein(idx: int):
+    """Simulate a truck reaching the consignee gate-in for JOURNEYS[idx].
+    Fires a proactive WhatsApp to the driver and arms the mapping."""
+    if idx < 0 or idx >= len(JOURNEYS):
+        return PlainTextResponse("bad journey index", status_code=400)
+    journey = JOURNEYS[idx]
+    logstep(f"GATE-IN triggered for {journey['journey_fteid']} ({journey['consignee_name']})")
+    TRIGGERED[DRIVER_NUMBER] = journey
+    SESSIONS.pop(DRIVER_NUMBER, None)  # force language menu fresh
+    ok = send_whatsapp(DRIVER_NUMBER, gatein_message(journey))
+    return PlainTextResponse("sent" if ok else "failed (check 24h window / creds)",
+                             status_code=200 if ok else 500)
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     import json as _json
@@ -334,7 +402,8 @@ def home():
     n_unclean = sum(1 for r in rows if r.get("verdict") == "PENDING_L1")
 
     data_json = _json.dumps(rows)
-    return DASHBOARD_HTML.replace("__ROWS__", data_json)\
+    journeys_json = _json.dumps([{"consignee_name": j["consignee_name"], "waybill_number": j["waybill_number"]} for j in JOURNEYS])
+    return DASHBOARD_HTML.replace("__ROWS__", data_json).replace("__JOURNEYS__", journeys_json)\
         .replace("__PENDING__", str(n_pending)).replace("__SUBMITTED__", str(n_submitted))\
         .replace("__REJECTED__", str(n_rejected)).replace("__APPROVED__", str(n_approved))\
         .replace("__CLEAN__", str(n_clean)).replace("__UNCLEAN__", str(n_unclean))\
@@ -403,6 +472,12 @@ transform:translateX(100%);transition:transform .25s;z-index:11;padding:26px 30p
       <div class="subrow"><span><b>__CLEAN__</b> Clean Delivery</span><span>|</span><span><b>__UNCLEAN__</b> Unclean Delivery</span></div></div>
   </div>
   <div style="margin-bottom:12px;font-size:14px;color:#5C6B7E">__COUNT__ Trips available</div>
+  <div id="gatein" style="background:#fff;border:1px solid #E3E8EF;border-radius:10px;padding:16px 18px;margin-bottom:18px">
+    <div style="font-size:13px;font-weight:700;color:#2563EB;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px">🚚 Simulate Gate-In (proactive trigger)</div>
+    <div style="font-size:13px;color:#5C6B7E;margin-bottom:12px">In production this fires automatically when the truck geofences into the consignee. Click to send the driver a proactive "upload your POD" WhatsApp for that delivery.</div>
+    <div id="gbtns" style="display:flex;gap:10px;flex-wrap:wrap"></div>
+    <div id="gmsg" style="font-size:13px;margin-top:10px;color:#5C6B7E"></div>
+  </div>
   <table>
     <thead><tr><th>LR / Waybill</th><th>Transporter</th><th>Route</th><th>Material</th><th>Approval Status</th><th>Actions</th></tr></thead>
     <tbody id="tbody"></tbody>
@@ -412,6 +487,21 @@ transform:translateX(100%);transition:transform .25s;z-index:11;padding:26px 30p
 <div class="panel" id="panel"></div>
 <script>
 const DATA = __ROWS__;
+const JOURNEYS = __JOURNEYS__;
+// gate-in buttons
+document.getElementById('gbtns').innerHTML = JOURNEYS.map((j,i)=>
+  `<button class="viewbtn" style="border-color:#128C4B;color:#128C4B" onclick="fireGateIn(${i},this)">${j.consignee_name} · ${j.waybill_number}</button>`
+).join('');
+function fireGateIn(i,btn){
+  const m=document.getElementById('gmsg');
+  m.textContent='Sending gate-in message to driver…'; btn.disabled=true;
+  fetch('/gatein/'+i,{method:'POST'}).then(r=>r.text()).then(t=>{
+    m.innerHTML = t==='sent'
+      ? '✅ Gate-in message sent to driver on WhatsApp. Reply there with the POD photo — it will map to <b>'+JOURNEYS[i].waybill_number+'</b>.'
+      : '⚠️ '+t+' — make sure you\'ve messaged the sandbox in the last 24h.';
+    btn.disabled=false;
+  }).catch(e=>{m.textContent='Error: '+e;btn.disabled=false;});
+}
 const VP = {AUTO_APPROVED:['ok','APPROVED'],PENDING_L1:['warn','UNCLEAN · L1'],REJECTED:['rej','REJECTED'],ERROR:['rej','ERROR']};
 function pill(v){const p=VP[v]||['warn',v||'—'];return `<span class="pill ${p[0]}">${p[1]}</span>`;}
 function routeCell(r){
