@@ -43,6 +43,10 @@ def logstep(msg):
 # JOURNEY DATA
 # ============================================================================
 JOURNEYS = [
+    {"journey_fteid": "JRN-JBP-1889", "waybill_number": "6007 0471 8894",
+     "consignor_name": "Tata Motors Ltd", "transporter_name": "Safexpress",
+     "consignee_name": "Frontier Trucks Pvt Ltd (Jabalpur)", "total_invoice_value": 36335,
+     "materials": [{"material_code": "M001", "description": "Auto components"}], "rate_card": {"M001": 380}},
     {"journey_fteid": "JRN-JBP-8894", "waybill_number": "6907 0473 8894",
      "consignor_name": "Tata Motors Ltd", "transporter_name": "Safexpress",
      "consignee_name": "Frontier Trucks (Jabalpur)", "total_invoice_value": 36335,
@@ -267,9 +271,16 @@ async def whatsapp(request: Request):
             msg_en = verdict_message_en(result, journey, debit) if (journey or result["verdict"] != "REJECTED") \
                 else verdict_message_en(result, {"waybill_number": ocr.get("waybill_number")}, None)
             msg = translate(msg_en, lang_name)
+            img_b64 = "data:%s;base64,%s" % (ctype, base64.b64encode(image_bytes).decode())
             entry.update({"waybill": ocr.get("waybill_number"), "verdict": result["verdict"],
                           "journey": journey["journey_fteid"] if journey else None,
-                          "reason": result["reasons"][0] if result["reasons"] else ""})
+                          "consignor": journey["consignor_name"] if journey else "-",
+                          "consignee": journey["consignee_name"] if journey else "-",
+                          "transporter": journey["transporter_name"] if journey else "Unknown",
+                          "invoice_value": journey["total_invoice_value"] if journey else None,
+                          "debit": debit["amount"] if debit else None,
+                          "reason": result["reasons"][0] if result["reasons"] else "",
+                          "image": img_b64, "source": "WhatsApp"})
             HISTORY.insert(0, entry)
             logstep(f"VERDICT: {result['verdict']} for {ocr.get('waybill_number')} -> replying in {lang_name}")
             return twiml_reply(msg)
@@ -293,22 +304,159 @@ async def whatsapp(request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    rows = "".join(
-        f"<tr><td>{h['time']}</td><td>{h.get('lang','-')}</td><td>{h.get('waybill','-')}</td>"
-        f"<td>{h.get('verdict','-')}</td><td>{h.get('reason','')}</td></tr>"
-        for h in HISTORY) or "<tr><td colspan=5 style='color:#888'>No PODs yet — send one on WhatsApp</td></tr>"
-    keyset = "set" if os.environ.get("OPENAI_API_KEY") else "MISSING"
-    twset = "set" if os.environ.get("TWILIO_ACCOUNT_SID") else "MISSING"
-    return f"""<!doctype html><meta charset=utf-8><title>ePOD Guardian</title>
-<body style="font-family:system-ui;background:#0B2545;color:#fff;padding:30px">
-<h2>ePOD Guardian — WhatsApp bot</h2>
-<p style="color:#9DB2CE">OPENAI_API_KEY: {keyset} &nbsp;|&nbsp; TWILIO_ACCOUNT_SID: {twset} &nbsp;|&nbsp; Languages: EN/HI/TA/KN/TE/MR</p>
-<p style="color:#9DB2CE">Send a POD photo to your Twilio WhatsApp sandbox number. Verdicts appear below.</p>
-<table style="width:100%;border-collapse:collapse;margin-top:16px;background:#fff;color:#12233B;border-radius:8px;overflow:hidden">
-<tr style="background:#F5A623;text-align:left"><th style="padding:10px">Time</th><th>Lang</th><th>Waybill</th><th>Verdict</th><th>Reason</th></tr>
-{rows}</table>
-<p style="color:#9DB2CE;margin-top:20px;font-size:13px">Known waybills: {", ".join(j['waybill_number'] for j in JOURNEYS)}</p>
-</body>"""
+    import json as _json
+    # Seed rows (modeled on the FT Settlement screen) + live WhatsApp submissions on top.
+    seed = [
+        {"time": "seed", "waybill": "FTI2", "verdict": "REJECTED", "transporter": "ProtoShip Logistics",
+         "consignor": "FT Product Demo", "consignee": "ProtoFreight Consignees",
+         "route_from": "315, Work Avenue, GK Co...", "route_to": "Scion Enclave, Govindapp...",
+         "material": "Tyre 100", "invoice_value": None, "debit": None,
+         "reason": "POD rejected by transporter — delivery rejected.", "source": "Driver App", "image": None,
+         "so": "SO-123", "do": "DO-123", "invoice": "INV-10-123-2025", "vehicle": "KA03AB2341"},
+        {"time": "seed", "waybill": "6907 0473 8894", "verdict": "AUTO_APPROVED", "transporter": "Safexpress",
+         "consignor": "Tata Motors Ltd", "consignee": "Frontier Trucks (Jabalpur)",
+         "route_from": "Nagpur", "route_to": "Jabalpur-11", "material": "Auto components",
+         "invoice_value": 36335, "debit": None, "reason": "", "source": "WhatsApp", "image": None},
+        {"time": "seed", "waybill": "7007 0446 0354", "verdict": "PENDING_L1", "transporter": "Safexpress",
+         "consignor": "TML Commercial Vehicles Ltd", "consignee": "Libra Automotors (Patiala)",
+         "route_from": "WBS001", "route_to": "Rajpura-11", "material": "Auto components",
+         "invoice_value": 1041, "debit": 760, "reason": "Damage/shortage recorded: 2 units short — carton torn.",
+         "source": "WhatsApp", "image": None},
+    ]
+    rows = HISTORY + seed
+
+    # status card counts
+    n_pending = sum(1 for r in rows if r.get("verdict") == "PENDING_SUBMISSION")
+    n_submitted = sum(1 for r in rows if r.get("verdict") in ("AUTO_APPROVED", "PENDING_L1"))
+    n_rejected = sum(1 for r in rows if r.get("verdict") == "REJECTED")
+    n_approved = sum(1 for r in rows if r.get("verdict") == "AUTO_APPROVED")
+    n_clean = sum(1 for r in rows if r.get("verdict") == "AUTO_APPROVED")
+    n_unclean = sum(1 for r in rows if r.get("verdict") == "PENDING_L1")
+
+    data_json = _json.dumps(rows)
+    return DASHBOARD_HTML.replace("__ROWS__", data_json)\
+        .replace("__PENDING__", str(n_pending)).replace("__SUBMITTED__", str(n_submitted))\
+        .replace("__REJECTED__", str(n_rejected)).replace("__APPROVED__", str(n_approved))\
+        .replace("__CLEAN__", str(n_clean)).replace("__UNCLEAN__", str(n_unclean))\
+        .replace("__COUNT__", str(len(rows)))
+
+
+DASHBOARD_HTML = r"""<!doctype html><meta charset=utf-8><title>Settlement · ePOD Guardian</title>
+<style>
+*{box-sizing:border-box;font-family:'Segoe UI',system-ui,sans-serif;margin:0}
+body{background:#F7F8FA;color:#1a2332}
+.top{background:#fff;border-bottom:1px solid #E3E8EF;padding:20px 32px}
+.top h1{font-size:22px;font-weight:600}
+.tabs{display:flex;gap:28px;padding:0 32px;background:#fff;border-bottom:1px solid #E3E8EF}
+.tab{padding:14px 2px;font-size:15px;color:#5C6B7E;cursor:pointer;border-bottom:2px solid transparent}
+.tab.active{color:#2563EB;border-bottom-color:#2563EB;font-weight:600}
+.tab .badge{background:#EEF2F7;border-radius:10px;padding:1px 8px;font-size:12px;margin-left:6px}
+.wrap{padding:24px 32px}
+.filterbar{margin-bottom:18px}
+.tdrop{border:1px solid #E3E8EF;border-radius:8px;padding:10px 16px;background:#fff;color:#5C6B7E;display:inline-block;min-width:220px;font-size:14px}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.card{background:#fff;border:1px solid #E3E8EF;border-radius:10px;padding:18px 20px}
+.card .n{font-size:26px;font-weight:600}
+.card .l{font-size:14px;color:#5C6B7E;margin-top:2px}
+.card.rej .n,.card.rej .l{color:#2563EB}
+.card.appr{position:relative}
+.subrow{display:flex;gap:16px;margin-top:12px;background:#F7F8FA;border-radius:8px;padding:8px 12px;font-size:13px;color:#5C6B7E}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #E3E8EF;border-radius:10px;overflow:hidden}
+th{text-align:left;padding:14px 18px;font-size:13px;color:#5C6B7E;font-weight:600;border-bottom:1px solid #E3E8EF}
+td{padding:16px 18px;font-size:14px;border-bottom:1px solid #F0F2F5;vertical-align:top}
+tr:last-child td{border-bottom:none}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:16px;font-size:12px;font-weight:600}
+.pill.ok{background:#E7F3EC;color:#1D7D46}.pill.warn{background:#FDF2E2;color:#B3720F}.pill.rej{background:#FBE9E8;color:#B3261E}
+.src{display:inline-block;font-size:11px;background:#EEF2F7;color:#5C6B7E;border-radius:6px;padding:2px 7px;margin-top:4px}
+.src.wa{background:#E7F5EC;color:#128C4B}
+.viewbtn{border:1px solid #2563EB;color:#2563EB;background:#fff;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer}
+.route{font-size:13px;color:#5C6B7E;line-height:1.5}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+/* slide panel */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;z-index:10}
+.panel{position:fixed;top:0;right:0;width:640px;max-width:92vw;height:100%;background:#fff;overflow-y:auto;
+transform:translateX(100%);transition:transform .25s;z-index:11;padding:26px 30px}
+.panel.open{transform:translateX(0)}.overlay.open{display:block}
+.pclose{float:right;font-size:22px;color:#5C6B7E;cursor:pointer;border:none;background:none}
+.rbanner{background:#FBE9E8;border-radius:8px;padding:12px 14px;color:#B3261E;font-weight:600;margin:14px 0;display:flex;align-items:center;gap:8px}
+.wbanner{background:#FDF2E2;color:#B3720F}
+.gbanner{background:#E7F3EC;color:#1D7D46}
+.pgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin:18px 0}
+.pgrid .lab{font-size:12px;color:#8A97A8}.pgrid .val{font-size:14px;font-weight:500;margin-top:2px}
+.podimg{width:100%;border:1px solid #E3E8EF;border-radius:10px;margin-top:10px}
+.aibox{background:#F0F6FF;border:1px solid #CFE0FA;border-radius:10px;padding:14px;margin-top:16px}
+.aibox .h{font-size:12px;font-weight:700;color:#2563EB;text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px}
+</style>
+<div class="top"><h1>Settlement <span style="font-size:13px;color:#8A97A8;font-weight:400">· ePOD Guardian (AI-validated via WhatsApp)</span></h1></div>
+<div class="tabs">
+  <div class="tab active">POD <span class="badge">__COUNT__</span></div>
+  <div class="tab">Freight Invoices</div>
+  <div class="tab">Debit Notes</div>
+</div>
+<div class="wrap">
+  <div class="filterbar"><span class="tdrop">All Transporter ▾</span></div>
+  <div class="cards">
+    <div class="card"><div class="n">__PENDING__</div><div class="l">Pending Submission</div></div>
+    <div class="card"><div class="n">__SUBMITTED__</div><div class="l">Submitted</div></div>
+    <div class="card rej"><div class="n">__REJECTED__ ⊘</div><div class="l">Rejected</div></div>
+    <div class="card appr"><div class="n">__APPROVED__ Approved</div>
+      <div class="subrow"><span><b>__CLEAN__</b> Clean Delivery</span><span>|</span><span><b>__UNCLEAN__</b> Unclean Delivery</span></div></div>
+  </div>
+  <div style="margin-bottom:12px;font-size:14px;color:#5C6B7E">__COUNT__ Trips available</div>
+  <table>
+    <thead><tr><th>LR / Waybill</th><th>Transporter</th><th>Route</th><th>Material</th><th>Approval Status</th><th>Actions</th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+<div class="overlay" id="ov" onclick="closePanel()"></div>
+<div class="panel" id="panel"></div>
+<script>
+const DATA = __ROWS__;
+const VP = {AUTO_APPROVED:['ok','APPROVED'],PENDING_L1:['warn','UNCLEAN · L1'],REJECTED:['rej','REJECTED'],ERROR:['rej','ERROR']};
+function pill(v){const p=VP[v]||['warn',v||'—'];return `<span class="pill ${p[0]}">${p[1]}</span>`;}
+function routeCell(r){
+  const f=r.route_from||r.consignor||'-', t=r.route_to||r.consignee||'-';
+  return `<div class="route"><span class="dot" style="background:#1D7D46"></span>${f}<br><span class="dot" style="background:#B3261E"></span>${t}</div>`;}
+function srcTag(s){return `<span class="src ${s==='WhatsApp'?'wa':''}">${s||'—'}</span>`;}
+document.getElementById('tbody').innerHTML = DATA.map((r,i)=>`
+  <tr>
+    <td><b>${r.waybill||'-'}</b>${r.verdict==='REJECTED'?'<div style="color:#B3261E;font-size:12px;margin-top:3px">Delivery rejected</div>':''}<br>${srcTag(r.source)}</td>
+    <td>${r.transporter||'-'}</td>
+    <td>${routeCell(r)}</td>
+    <td>${r.material||'-'}</td>
+    <td>${pill(r.verdict)}</td>
+    <td><button class="viewbtn" onclick='openPanel(${i})'>View ePOD</button></td>
+  </tr>`).join('');
+function openPanel(i){
+  const r=DATA[i];
+  let banner='';
+  if(r.verdict==='REJECTED') banner=`<div class="rbanner">⊘ POD rejected — AI validation failed</div>`;
+  else if(r.verdict==='PENDING_L1') banner=`<div class="rbanner wbanner">⚠ Unclean delivery — pending L1 approval</div>`;
+  else if(r.verdict==='AUTO_APPROVED') banner=`<div class="rbanner gbanner">✓ POD auto-approved — billing unlocked</div>`;
+  const ai = r.reason ? `<div class="aibox"><div class="h">🤖 AI validation reason</div>${r.reason}${r.debit?`<div style="margin-top:8px;color:#B3261E;font-weight:600">Provisional debit note: ₹${Number(r.debit).toLocaleString('en-IN')}</div>`:''}</div>` : `<div class="aibox"><div class="h">🤖 AI validation</div>All checks passed. Clean delivery, no damage or shortage detected.</div>`;
+  const img = r.image ? `<div class="pgrid" style="grid-template-columns:1fr"><div><div class="lab">POD IMAGE (received via ${r.source})</div><img class="podimg" src="${r.image}"></div></div>` : `<div class="aibox" style="background:#F7F8FA;border-color:#E3E8EF;color:#8A97A8">POD image will appear here when sent via WhatsApp.</div>`;
+  document.getElementById('panel').innerHTML=`
+    <button class="pclose" onclick="closePanel()">✕</button>
+    <div style="font-size:18px;font-weight:600">Waybill ${r.waybill||'-'} ${srcTag(r.source)}</div>
+    ${banner}
+    <div class="pgrid">
+      <div><div class="lab">Consignor</div><div class="val">${r.consignor||'-'}</div></div>
+      <div><div class="lab">Consignee</div><div class="val">${r.consignee||'-'}</div></div>
+      <div><div class="lab">Transporter</div><div class="val">${r.transporter||'-'}</div></div>
+      <div><div class="lab">SO</div><div class="val">${r.so||'—'}</div></div>
+      <div><div class="lab">DO</div><div class="val">${r.do||'—'}</div></div>
+      <div><div class="lab">Invoice</div><div class="val">${r.invoice||'—'}</div></div>
+      <div><div class="lab">Invoice Value</div><div class="val">${r.invoice_value?'₹'+Number(r.invoice_value).toLocaleString('en-IN'):'—'}</div></div>
+      <div><div class="lab">Vehicle</div><div class="val">${r.vehicle||'—'}</div></div>
+      <div><div class="lab">Language</div><div class="val">${r.lang||'—'}</div></div>
+    </div>
+    ${ai}
+    ${img}`;
+  document.getElementById('panel').classList.add('open');
+  document.getElementById('ov').classList.add('open');
+}
+function closePanel(){document.getElementById('panel').classList.remove('open');document.getElementById('ov').classList.remove('open');}
+</script>"""
 
 
 if __name__ == "__main__":
