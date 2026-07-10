@@ -1,98 +1,108 @@
 """
-ePOD Guardian - WhatsApp bot (single file)
-FreightTiger hackathon demo
+ePOD Guardian - WhatsApp bot (single file)  |  FreightTiger hackathon
+STEP 1: guided multilingual flow + AI translation + detailed logging
 
-WHAT IT DOES
-  A driver sends a POD photo to your Twilio WhatsApp sandbox number.
-  This app: receives it -> downloads the image -> reads it with OpenAI vision
-  -> matches the waybill number to a known journey -> validates -> replies in
-  the SAME WhatsApp chat with the verdict.
+FLOW (metro-ticket style):
+  Driver sends anything -> welcome + language menu (reply 1-6)
+  Driver picks language -> bot confirms + asks for POD photo (in their language)
+  Driver sends photo -> AI reads + validates -> verdict replied in their language
 
-RUN LOCALLY (with ngrok, simplest)
-  1. pip install fastapi uvicorn requests python-multipart
-  2. export OPENAI_API_KEY=sk-...            # your OpenAI key (needs credit)
-     export TWILIO_ACCOUNT_SID=AC...          # from Twilio console
-     export TWILIO_AUTH_TOKEN=...             # from Twilio console (secret)
-  3. python epod_whatsapp.py                  # starts on port 8010
-  4. In another terminal:  ngrok http 8010
-  5. Copy the ngrok https URL, go to Twilio console ->
-     Messaging -> Try it out -> Send a WhatsApp message -> "Sandbox settings",
-     set "When a message comes in" to:  <ngrok-url>/whatsapp   (POST)
-  6. From your phone (already joined the sandbox) send a POD photo. Done.
-
-  Also open  http://localhost:8010  for a web view of every submission.
-
-NOTES
-  - Keys are read from the environment, never stored in this file.
-  - Matching is on the waybill number read off the image.
-  - Update JOURNEYS below anytime to add deliveries.
+Keys come from environment: OPENAI_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+Update path: edit this file on GitHub -> Render auto-redeploys.
 """
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
+import sys
 from datetime import datetime
 
 import requests
 import uvicorn
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 # ============================================================================
-# JOURNEY DATA  (source of truth incoming PODs are matched against)
-# Built from the three Safexpress waybills provided. Materials are placeholders
-# (not legible on the photos) - swap in real codes/rates anytime.
+# LOGGING - verbose, so failures are visible in Render logs
+# ============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("epod")
+
+
+def logstep(msg):
+    log.info(msg)
+
+
+# ============================================================================
+# JOURNEY DATA
 # ============================================================================
 JOURNEYS = [
-    {
-        "journey_fteid": "JRN-JBP-8894",
-        "waybill_number": "6907 0473 8894",
-        "consignor_name": "Tata Motors Ltd",
-        "transporter_name": "Safexpress",
-        "consignee_name": "Frontier Trucks (Jabalpur)",
-        "total_invoice_value": 36335,
-        "materials": [{"material_code": "M001", "description": "Auto components"}],
-        "rate_card": {"M001": 380},
-    },
-    {
-        "journey_fteid": "JRN-RJP-0354",
-        "waybill_number": "7007 0446 0354",
-        "consignor_name": "TML Commercial Vehicles Limited",
-        "transporter_name": "Safexpress",
-        "consignee_name": "Libra Automotors (Patiala)",
-        "total_invoice_value": 1041,
-        "materials": [{"material_code": "M001", "description": "Auto components"}],
-        "rate_card": {"M001": 380},
-    },
-    {
-        "journey_fteid": "JRN-PTNA-2299",
-        "waybill_number": "5007 0496 2299",
-        "consignor_name": "Tata Motors Limited",
-        "transporter_name": "Safexpress",
-        "consignee_name": "Binay Motors Private Limited (Patna)",
-        "total_invoice_value": 76000,
-        "materials": [{"material_code": "M001", "description": "Auto components"}],
-        "rate_card": {"M001": 380},
-    },
+    {"journey_fteid": "JRN-JBP-8894", "waybill_number": "6907 0473 8894",
+     "consignor_name": "Tata Motors Ltd", "transporter_name": "Safexpress",
+     "consignee_name": "Frontier Trucks (Jabalpur)", "total_invoice_value": 36335,
+     "materials": [{"material_code": "M001", "description": "Auto components"}], "rate_card": {"M001": 380}},
+    {"journey_fteid": "JRN-RJP-0354", "waybill_number": "7007 0446 0354",
+     "consignor_name": "TML Commercial Vehicles Limited", "transporter_name": "Safexpress",
+     "consignee_name": "Libra Automotors (Patiala)", "total_invoice_value": 1041,
+     "materials": [{"material_code": "M001", "description": "Auto components"}], "rate_card": {"M001": 380}},
+    {"journey_fteid": "JRN-PTNA-2299", "waybill_number": "5007 0496 2299",
+     "consignor_name": "Tata Motors Limited", "transporter_name": "Safexpress",
+     "consignee_name": "Binay Motors Private Limited (Patna)", "total_invoice_value": 76000,
+     "materials": [{"material_code": "M001", "description": "Auto components"}], "rate_card": {"M001": 380}},
 ]
-
 CRITICAL = ["waybill", "lr", "invoice", "number", "material", "signature", "stamp", "damage"]
 
-# in-memory record of everything processed (for the web view)
+# ============================================================================
+# LANGUAGES
+# ============================================================================
+LANGUAGES = {
+    "1": ("English", "English"),
+    "2": ("Hindi", "हिंदी"),
+    "3": ("Tamil", "தமிழ்"),
+    "4": ("Kannada", "ಕನ್ನಡ"),
+    "5": ("Telugu", "తెలుగు"),
+    "6": ("Marathi", "मराठी"),
+}
+
+WELCOME = (
+    "👋 *Welcome to ePOD Guardian* (FreightTiger)\n"
+    "Please choose your language / अपनी भाषा चुनें:\n\n"
+    "1. English\n"
+    "2. हिंदी (Hindi)\n"
+    "3. தமிழ் (Tamil)\n"
+    "4. ಕನ್ನಡ (Kannada)\n"
+    "5. తెలుగు (Telugu)\n"
+    "6. मराठी (Marathi)\n\n"
+    "_Reply with a number (1-6)_"
+)
+
+# English base strings; translated on the fly for other languages
+STRINGS_EN = {
+    "ask_photo": ("✅ Language set to English.\n\n"
+                  "📷 Now please send a *photo of the signed POD / waybill*.\n"
+                  "Tap the 📎 attach icon below and take or upload a clear photo of the full document."),
+    "reading": "⏳ Reading your document, please wait…",
+}
+
+# per-driver state: {phone: {"lang": "1", "lang_name": "English"}}
+SESSIONS: dict[str, dict] = {}
+# processed POD history for the dashboard
 HISTORY: list[dict] = []
 
 
 def norm(v):
-    return "" if v is None else "".join(ch for ch in str(v).upper() if ch.isalnum())
+    return "" if v is None else "".join(c for c in str(v).upper() if c.isalnum())
 
 
-def find_journey(waybill_number):
-    n = norm(waybill_number)
-    for j in JOURNEYS:
-        if norm(j["waybill_number"]) == n:
-            return j
-    return None
+def find_journey(wb):
+    n = norm(wb)
+    return next((j for j in JOURNEYS if norm(j["waybill_number"]) == n), None)
 
 
 # ============================================================================
@@ -100,92 +110,104 @@ def find_journey(waybill_number):
 # ============================================================================
 def run_engine(ocr, journey):
     checks, reasons = [], []
-
-    def add(check, status, reason=None):
-        checks.append({"check": check, "status": status, "reason": reason})
-
-    illegible = ocr.get("illegible_fields") or []
-    crit = [f for f in illegible if any(k in str(f).lower() for k in CRITICAL)]
-    if crit:
-        r = ("Document not readable: " + ", ".join(crit)
-             + ". Please retake with the full document in frame and good lighting.")
-        add("Legibility", "FAIL", r)
-        return {"verdict": "REJECTED", "condition": None, "checks": checks,
-                "reasons": [r], "shortage": None}
+    def add(c, s, r=None): checks.append({"check": c, "status": s, "reason": r})
+    illeg = [f for f in (ocr.get("illegible_fields") or []) if any(k in str(f).lower() for k in CRITICAL)]
+    if illeg:
+        r = "Document not readable: " + ", ".join(illeg) + ". Retake with the full document in frame and good lighting."
+        add("Legibility", "FAIL", r); return {"verdict": "REJECTED", "checks": checks, "reasons": [r], "shortage": None}
     add("Legibility", "PASS")
-
     if journey is None:
-        r = ("Waybill number on this document doesn't match any open delivery. "
-             "Please check you sent the correct POD.")
-        add("Waybill match", "FAIL", r)
-        return {"verdict": "REJECTED", "condition": None, "checks": checks,
-                "reasons": [r], "shortage": None}
+        r = "Waybill number doesn't match any open delivery. Check you sent the correct POD."
+        add("Waybill match", "FAIL", r); return {"verdict": "REJECTED", "checks": checks, "reasons": [r], "shortage": None}
     add("Waybill match", "PASS")
-
-    damage = bool(ocr.get("damage_or_shortage"))
-    notes = ocr.get("damage_notes") or []
-    if not damage:
+    if not ocr.get("damage_or_shortage"):
         add("Condition (damage / shortage)", "PASS", "No damage or shortage found")
-        return {"verdict": "AUTO_APPROVED", "condition": "CLEAN", "checks": checks,
-                "reasons": [], "shortage": None}
-
-    r = ("Damage/shortage recorded: " + "; ".join(notes) + "."
-         if notes else "Damage/shortage indicated on the document.")
+        return {"verdict": "AUTO_APPROVED", "checks": checks, "reasons": [], "shortage": None}
+    notes = ocr.get("damage_notes") or []
+    r = "Damage/shortage recorded: " + "; ".join(notes) + "." if notes else "Damage/shortage indicated."
     add("Condition (damage / shortage)", "FAIL", r)
-    return {"verdict": "PENDING_L1", "condition": "UNCLEAN", "checks": checks,
-            "reasons": [r], "shortage": {"items": ocr.get("shortage_items") or [], "notes": notes}}
+    return {"verdict": "PENDING_L1", "checks": checks, "reasons": [r],
+            "shortage": {"items": ocr.get("shortage_items") or [], "notes": notes}}
 
 
-def eval_debit(shortage_items, rate_card, invoice_value):
-    value, breakdown = 0.0, []
-    for it in shortage_items or []:
-        rate = rate_card.get(it.get("material_code"))
-        qty = it.get("shortage_qty") or 0
-        if rate and qty:
-            value += qty * rate
-            breakdown.append({**it, "rate": rate, "computed": qty * rate})
-    if value <= 0:
-        return {"raise": True, "amount": None, "breakdown": breakdown}
-    return {"raise": True, "amount": value, "breakdown": breakdown}
+def eval_debit(items, rate_card):
+    val = 0.0
+    for it in items or []:
+        rate, qty = rate_card.get(it.get("material_code")), it.get("shortage_qty") or 0
+        if rate and qty: val += rate * qty
+    return {"amount": val or None}
 
 
 # ============================================================================
-# OpenAI vision
+# OpenAI - vision + translation
 # ============================================================================
-VISION_PROMPT = """You are validating a proof-of-delivery (POD) / Safexpress waybill. Return ONLY valid JSON with these keys:
-{"waybill_number": string|null, "consignor": string|null, "consignee": string|null, "legible": boolean, "illegible_fields": string[], "damage_or_shortage": boolean, "damage_notes": string[], "shortage_items": [{"material_code": string, "shortage_qty": number}], "signature_present": boolean, "stamp_present": boolean}
+def _openai_key():
+    k = os.environ.get("OPENAI_API_KEY")
+    if not k:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    return k
 
-LEGIBILITY - only CRITICAL fields matter: the waybill number, and the signature/stamp/damage region.
-- Set legible=false and list a field ONLY IF a critical field cannot be read at all.
-- Minor fields (DIM, DOD/DACC, package weight, freight amount, dates) do NOT affect legibility. Never list them.
-- A normal phone photo with some blur is fine.
+
+VISION_PROMPT = """Validate this POD / Safexpress waybill. Return ONLY JSON:
+{"waybill_number": string|null, "legible": boolean, "illegible_fields": string[], "damage_or_shortage": boolean, "damage_notes": string[], "shortage_items": [{"material_code": string, "shortage_qty": number}], "signature_present": boolean, "stamp_present": boolean}
+Legibility: only critical fields matter (waybill number, signature/stamp/damage region). Minor fields (DIM, weight, dates) never count. Normal phone blur is fine.
 The waybill number is the long number near the top right (also in the barcode), format like "5007 0496 2299".
 damage_or_shortage=true only if there's a handwritten/printed note of damage, breakage, shortage, or missing quantity. A normal signature+stamp with no such note = false. Use false/null when unsure."""
 
 
-def extract_with_openai(image_bytes, media_type):
-    key = os.environ.get("OPENAI_API_KEY")
-    if not key:
-        raise RuntimeError("OPENAI_API_KEY not set")
+def extract_with_openai(image_bytes, mtype):
+    logstep(f"OCR: calling OpenAI vision ({len(image_bytes)} bytes, {mtype})")
     b64 = base64.b64encode(image_bytes).decode()
-    res = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={
-            "model": "gpt-4o",
-            "max_tokens": 1000,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": VISION_PROMPT},
-                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}"}},
-                ],
-            }],
-        },
-        timeout=60,
-    )
-    text = res.json()["choices"][0]["message"]["content"]
-    return json.loads(text.replace("```json", "").replace("```", "").strip())
+    res = requests.post("https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {_openai_key()}", "Content-Type": "application/json"},
+        json={"model": "gpt-4o", "max_tokens": 1000, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": VISION_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:{mtype};base64,{b64}"}}]}]}, timeout=60)
+    if res.status_code != 200:
+        logstep(f"OCR ERROR: OpenAI returned {res.status_code}: {res.text[:200]}")
+        res.raise_for_status()
+    txt = res.json()["choices"][0]["message"]["content"]
+    parsed = json.loads(txt.replace("```json", "").replace("```", "").strip())
+    logstep(f"OCR result: waybill={parsed.get('waybill_number')} damage={parsed.get('damage_or_shortage')} legible={parsed.get('legible')}")
+    return parsed
+
+
+def translate(text, lang_name):
+    """Translate English text to the target language. English passes through."""
+    if lang_name == "English":
+        return text
+    try:
+        logstep(f"TRANSLATE: -> {lang_name}")
+        res = requests.post("https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {_openai_key()}", "Content-Type": "application/json"},
+            json={"model": "gpt-4o-mini", "max_tokens": 800, "messages": [
+                {"role": "system", "content": f"Translate the user's message into {lang_name}. Keep emojis, numbers, waybill IDs, and *bold* markers exactly. Return only the translation, nothing else."},
+                {"role": "user", "content": text}]}, timeout=30)
+        if res.status_code == 200:
+            return res.json()["choices"][0]["message"]["content"].strip()
+        logstep(f"TRANSLATE ERROR {res.status_code}: {res.text[:150]}")
+    except Exception as e:
+        logstep(f"TRANSLATE EXCEPTION: {e}")
+    return text  # fall back to English on any failure
+
+
+# ============================================================================
+# Verdict message (English base)
+# ============================================================================
+def verdict_message_en(result, journey, debit):
+    if result["verdict"] == "AUTO_APPROVED":
+        return (f"✅ *POD ACCEPTED*\n\n"
+                f"Waybill: {journey['waybill_number']}\n"
+                f"Consignee: {journey['consignee_name']}\n"
+                f"Clean delivery — no damage found.\n"
+                f"Billing is now unlocked. You're all set, thank you!")
+    if result["verdict"] == "PENDING_L1":
+        amt = (f"₹{debit['amount']:,.0f}" if debit and debit.get("amount") else "to be confirmed")
+        return (f"⚠️ *POD RECEIVED — UNCLEAN*\n\n"
+                f"Waybill: {journey['waybill_number']}\n"
+                f"{result['reasons'][0]}\n"
+                f"This will go for L1 approval. A debit note ({amt}) may be raised. Thank you for reporting it.")
+    return (f"❌ *POD REJECTED*\n\n{result['reasons'][0]}\n\nPlease retake and send again.")
 
 
 # ============================================================================
@@ -194,7 +216,10 @@ def extract_with_openai(image_bytes, media_type):
 def download_twilio_media(media_url):
     sid = os.environ.get("TWILIO_ACCOUNT_SID")
     token = os.environ.get("TWILIO_AUTH_TOKEN")
+    logstep(f"MEDIA: downloading from Twilio")
     r = requests.get(media_url, auth=(sid, token), timeout=60)
+    if r.status_code != 200:
+        logstep(f"MEDIA ERROR: Twilio returned {r.status_code}")
     r.raise_for_status()
     return r.content, r.headers.get("Content-Type", "image/jpeg")
 
@@ -203,27 +228,7 @@ def twiml_reply(message):
     safe = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return PlainTextResponse(
         f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{safe}</Message></Response>',
-        media_type="application/xml",
-    )
-
-
-def verdict_message(result, journey, debit):
-    if result["verdict"] == "AUTO_APPROVED":
-        return (f"✅ POD ACCEPTED\n\n"
-                f"Waybill: {journey['waybill_number']}\n"
-                f"Consignee: {journey['consignee_name']}\n"
-                f"Clean delivery — no damage found.\n"
-                f"Billing is now unlocked. You're all set, thank you!")
-    if result["verdict"] == "PENDING_L1":
-        amt = (f"₹{debit['amount']:,.0f}" if debit and debit.get("amount") else "to be confirmed")
-        return (f"⚠️ POD RECEIVED — UNCLEAN\n\n"
-                f"Waybill: {journey['waybill_number']}\n"
-                f"{result['reasons'][0]}\n"
-                f"This will go for L1 approval. A debit note ({amt}) may be raised. "
-                f"Thank you for reporting it.")
-    # rejected
-    return (f"❌ POD REJECTED\n\n{result['reasons'][0]}\n\n"
-            f"Please retake and send again.")
+        media_type="application/xml")
 
 
 # ============================================================================
@@ -235,53 +240,72 @@ app = FastAPI()
 @app.post("/whatsapp")
 async def whatsapp(request: Request):
     form = await request.form()
-    num_media = int(form.get("NumMedia", 0))
     sender = form.get("From", "")
+    body = (form.get("Body") or "").strip()
+    num_media = int(form.get("NumMedia", 0))
+    logstep(f"INBOUND from {sender} | media={num_media} | body={body!r}")
 
-    if num_media == 0:
-        return twiml_reply(
-            "👋 Send a photo of the signed POD / waybill and I'll validate it instantly.")
+    session = SESSIONS.get(sender)
 
-    media_url = form.get("MediaUrl0")
-    media_type = form.get("MediaContentType0", "image/jpeg")
-    entry = {"time": datetime.now().strftime("%H:%M:%S"), "from": sender}
-    try:
-        image_bytes, ctype = download_twilio_media(media_url)
-        ocr = extract_with_openai(image_bytes, ctype)
-        journey = find_journey(ocr.get("waybill_number"))
-        result = run_engine(ocr, journey)
-        debit = None
-        if result["verdict"] == "PENDING_L1":
-            debit = eval_debit(result["shortage"]["items"],
-                               journey["rate_card"] if journey else {},
-                               journey["total_invoice_value"] if journey else None)
-        msg = verdict_message(result, journey, debit) if journey or result["verdict"] != "REJECTED" \
-            else verdict_message(result, {"waybill_number": ocr.get("waybill_number")}, None)
-        entry.update({"waybill": ocr.get("waybill_number"), "verdict": result["verdict"],
-                      "journey": journey["journey_fteid"] if journey else None})
-        HISTORY.insert(0, entry)
-        return twiml_reply(msg)
-    except Exception as e:
-        entry.update({"verdict": "ERROR", "error": str(e)})
-        HISTORY.insert(0, entry)
-        return twiml_reply("⚠️ Sorry, I couldn't read that image. Please retake it clearly and resend.")
+    # --- Case 1: a photo came in ---
+    if num_media > 0:
+        if not session:
+            # no language chosen yet - still process, default English, but nudge
+            logstep(f"{sender}: photo before language choice, defaulting English")
+            session = {"lang": "1", "lang_name": "English"}
+            SESSIONS[sender] = session
+        lang_name = session["lang_name"]
+        entry = {"time": datetime.now().strftime("%H:%M:%S"), "from": sender, "lang": lang_name}
+        try:
+            media_url = form.get("MediaUrl0")
+            mtype = form.get("MediaContentType0", "image/jpeg")
+            image_bytes, ctype = download_twilio_media(media_url)
+            ocr = extract_with_openai(image_bytes, ctype)
+            journey = find_journey(ocr.get("waybill_number"))
+            result = run_engine(ocr, journey)
+            debit = eval_debit(result["shortage"]["items"], journey["rate_card"]) if (result["verdict"] == "PENDING_L1" and journey) else None
+            msg_en = verdict_message_en(result, journey, debit) if (journey or result["verdict"] != "REJECTED") \
+                else verdict_message_en(result, {"waybill_number": ocr.get("waybill_number")}, None)
+            msg = translate(msg_en, lang_name)
+            entry.update({"waybill": ocr.get("waybill_number"), "verdict": result["verdict"],
+                          "journey": journey["journey_fteid"] if journey else None,
+                          "reason": result["reasons"][0] if result["reasons"] else ""})
+            HISTORY.insert(0, entry)
+            logstep(f"VERDICT: {result['verdict']} for {ocr.get('waybill_number')} -> replying in {lang_name}")
+            return twiml_reply(msg)
+        except Exception as e:
+            logstep(f"ERROR processing photo: {type(e).__name__}: {e}")
+            entry.update({"verdict": "ERROR", "error": str(e)})
+            HISTORY.insert(0, entry)
+            return twiml_reply(translate("⚠️ Sorry, I couldn't read that image. Please retake it clearly and send again.", lang_name))
+
+    # --- Case 2: a language choice (1-6) ---
+    if body in LANGUAGES:
+        eng_name, native = LANGUAGES[body]
+        SESSIONS[sender] = {"lang": body, "lang_name": eng_name}
+        logstep(f"{sender}: language set to {eng_name}")
+        return twiml_reply(translate(STRINGS_EN["ask_photo"], eng_name))
+
+    # --- Case 3: anything else -> show welcome/menu ---
+    logstep(f"{sender}: showing welcome menu")
+    return twiml_reply(WELCOME)
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
     rows = "".join(
-        f"<tr><td>{h['time']}</td><td>{h.get('waybill','-')}</td>"
-        f"<td>{h.get('verdict','-')}</td><td>{h.get('journey','-')}</td></tr>"
-        for h in HISTORY) or "<tr><td colspan=4 style='color:#888'>No PODs yet — send one on WhatsApp</td></tr>"
+        f"<tr><td>{h['time']}</td><td>{h.get('lang','-')}</td><td>{h.get('waybill','-')}</td>"
+        f"<td>{h.get('verdict','-')}</td><td>{h.get('reason','')}</td></tr>"
+        for h in HISTORY) or "<tr><td colspan=5 style='color:#888'>No PODs yet — send one on WhatsApp</td></tr>"
     keyset = "set" if os.environ.get("OPENAI_API_KEY") else "MISSING"
     twset = "set" if os.environ.get("TWILIO_ACCOUNT_SID") else "MISSING"
-    return f"""<!doctype html><meta charset=utf-8>
+    return f"""<!doctype html><meta charset=utf-8><title>ePOD Guardian</title>
 <body style="font-family:system-ui;background:#0B2545;color:#fff;padding:30px">
 <h2>ePOD Guardian — WhatsApp bot</h2>
-<p style="color:#9DB2CE">OPENAI_API_KEY: {keyset} &nbsp;|&nbsp; TWILIO_ACCOUNT_SID: {twset}</p>
+<p style="color:#9DB2CE">OPENAI_API_KEY: {keyset} &nbsp;|&nbsp; TWILIO_ACCOUNT_SID: {twset} &nbsp;|&nbsp; Languages: EN/HI/TA/KN/TE/MR</p>
 <p style="color:#9DB2CE">Send a POD photo to your Twilio WhatsApp sandbox number. Verdicts appear below.</p>
 <table style="width:100%;border-collapse:collapse;margin-top:16px;background:#fff;color:#12233B;border-radius:8px;overflow:hidden">
-<tr style="background:#F5A623;text-align:left"><th style="padding:10px">Time</th><th>Waybill</th><th>Verdict</th><th>Journey</th></tr>
+<tr style="background:#F5A623;text-align:left"><th style="padding:10px">Time</th><th>Lang</th><th>Waybill</th><th>Verdict</th><th>Reason</th></tr>
 {rows}</table>
 <p style="color:#9DB2CE;margin-top:20px;font-size:13px">Known waybills: {", ".join(j['waybill_number'] for j in JOURNEYS)}</p>
 </body>"""
@@ -289,4 +313,5 @@ def home():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8010))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    logstep(f"Starting ePOD Guardian on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
