@@ -94,6 +94,8 @@ STRINGS_EN = {
     "ask_waybill": ("✅ Language set to English.\n\n"
                     "Please type the *LR / Waybill number* for this delivery (the 12-digit number on the document, e.g. 6007 0471 8894)."),
     "not_found": ("❌ No open delivery found for that number. Please check the waybill and type it again."),
+    "multi_delivery": ("📑 It looks like you've sent paperwork for *more than one delivery* at once. "
+                       "Please send *one delivery at a time* — the POD pages for a single waybill. Thank you!"),
     "reading": "⏳ Reading your document, please wait…",
 }
 
@@ -187,6 +189,22 @@ LEGIBILITY: only critical fields matter (waybill number, signature/stamp/damage 
 DAMAGE/SHORTAGE: damage_or_shortage=true only if there's a handwritten/printed note of damage, breakage, shortage, or missing quantity. A normal signature+stamp with no such note = false. Use false/null when unsure."""
 
 
+VISION_PROMPT_MULTI = """You are validating a Proof of Delivery submission. It may be a single image, MULTIPLE images, or a PDF with several pages. The items are given IN ORDER (index 0, 1, 2, ...). Together they are ONE delivery's paperwork (e.g. front/back or multiple pages of the same waybill).
+
+Look across ALL pages/images and return ONLY JSON:
+{"waybill_number": string|null, "waybill_confidence": number, "signed_page_index": integer, "legible": boolean, "illegible_fields": string[], "damage_or_shortage": boolean, "damage_notes": string[], "shortage_items": [{"material_code": string, "shortage_qty": number}], "signature_present": boolean, "stamp_present": boolean, "multiple_deliveries": boolean}
+
+"signed_page_index": the 0-based index of the page/image that best shows the signed & stamped waybill (the one to display as proof). If only one item, use 0.
+"multiple_deliveries": true ONLY if the pages clearly show DIFFERENT waybill numbers for DIFFERENT deliveries (a batch of separate PODs), false if they're all the same delivery.
+
+READING THE WAYBILL NUMBER (be careful):
+- 12 digits formatted 4-4-4, like "6007 0471 8894". It appears near a "Waybill No." box and as digits under the barcode - the barcode digits are cleanest, prefer them. Cross-check both copies.
+- Watch 0/6, 4/6, 1/7, 8/3 confusion. Set waybill_confidence 0.0-1.0 (>=0.9 only if both copies agree).
+
+LEGIBILITY: only critical fields matter (waybill number, signature/stamp/damage). Minor fields never count. Normal phone blur is fine.
+DAMAGE/SHORTAGE: true only if there's a note of damage/breakage/shortage/missing qty. Normal signature+stamp with no such note = false."""
+
+
 def extract_with_openai(image_bytes, mtype):
     logstep(f"OCR: calling OpenAI vision ({len(image_bytes)} bytes, {mtype})")
     b64 = base64.b64encode(image_bytes).decode()
@@ -202,6 +220,40 @@ def extract_with_openai(image_bytes, mtype):
     parsed = json.loads(txt.replace("```json", "").replace("```", "").strip())
     logstep(f"OCR result: waybill={parsed.get('waybill_number')} confidence={parsed.get('waybill_confidence')} damage={parsed.get('damage_or_shortage')} legible={parsed.get('legible')}")
     return parsed
+
+
+def extract_multi(attachments):
+    """Unified reader: attachments is a list of (bytes, content_type).
+    Images and PDFs are sent together as ONE document. OpenAI reads across all
+    pages/images, extracts the waybill + signature/damage, tells us which
+    page/image holds the signed waybill, and flags if it looks like multiple
+    different deliveries. Returns (parsed_json, best_index)."""
+    logstep(f"OCR: multi-attachment read, {len(attachments)} item(s): "
+            + ", ".join(ct for _, ct in attachments))
+    content = [{"type": "text", "text": VISION_PROMPT_MULTI}]
+    for i, (data, ct) in enumerate(attachments):
+        b64 = base64.b64encode(data).decode()
+        if "pdf" in ct.lower():
+            content.append({"type": "file", "file": {
+                "filename": f"pod_{i}.pdf", "file_data": f"data:application/pdf;base64,{b64}"}})
+        else:
+            content.append({"type": "image_url", "image_url": {"url": f"data:{ct};base64,{b64}"}})
+    res = requests.post("https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {_openai_key()}", "Content-Type": "application/json"},
+        json={"model": "gpt-4o", "max_tokens": 1200, "messages": [{"role": "user", "content": content}]},
+        timeout=120)
+    if res.status_code != 200:
+        logstep(f"OCR ERROR: OpenAI returned {res.status_code}: {res.text[:300]}")
+        res.raise_for_status()
+    txt = res.json()["choices"][0]["message"]["content"]
+    parsed = json.loads(txt.replace("```json", "").replace("```", "").strip())
+    best = parsed.get("signed_page_index")
+    if not isinstance(best, int) or best < 0 or best >= len(attachments):
+        best = 0
+    logstep(f"OCR multi: waybill={parsed.get('waybill_number')} conf={parsed.get('waybill_confidence')} "
+            f"signed_page={parsed.get('signed_page_index')} multi_delivery={parsed.get('multiple_deliveries')} "
+            f"damage={parsed.get('damage_or_shortage')}")
+    return parsed, best
 
 
 def translate(text, lang_name):
@@ -311,40 +363,56 @@ async def whatsapp(request: Request):
     session = SESSIONS.get(sender)
     has_trigger = sender in TRIGGERED
 
-    # --- A photo came in ---
+    # --- A photo / PDF / multiple attachments came in ---
     if num_media > 0:
         if not session:
-            logstep(f"{sender}: photo before language choice, defaulting English")
+            logstep(f"{sender}: media before language choice, defaulting English")
             session = {"lang": "1", "lang_name": "English"}
             SESSIONS[sender] = session
         lang_name = session["lang_name"]
         entry = {"time": datetime.now().strftime("%H:%M:%S"), "from": sender, "lang": lang_name}
         try:
-            media_url = form.get("MediaUrl0")
-            mtype = form.get("MediaContentType0", "image/jpeg")
-            image_bytes, ctype = download_twilio_media(media_url)
-            ocr = extract_with_openai(image_bytes, ctype)
-            # Mapping priority:
-            # 1) gate-in trigger (we already know the journey)
-            # 2) waybill the driver TYPED earlier in this chat (ground truth)
-            # 3) waybill read off the image (cold fallback)
+            # gather ALL attachments (MediaUrl0..N), not just the first
+            attachments = []
+            for i in range(num_media):
+                murl = form.get(f"MediaUrl{i}")
+                mct = form.get(f"MediaContentType{i}", "image/jpeg")
+                if not murl:
+                    continue
+                data, ctype = download_twilio_media(murl)
+                attachments.append((data, ctype))
+            logstep(f"{sender}: gathered {len(attachments)} attachment(s)")
+            if not attachments:
+                return twiml_reply(translate("⚠️ I didn't receive the file. Please resend the POD.", lang_name))
+
+            ocr, best = extract_multi(attachments)
+
+            # graceful guard: looks like several different deliveries in one message
+            if ocr.get("multiple_deliveries"):
+                logstep(f"{sender}: multiple_deliveries flagged -> asking one at a time")
+                return twiml_reply(translate(STRINGS_EN["multi_delivery"], lang_name))
+
+            # Mapping priority: gate-in trigger > driver-typed waybill > image-read waybill
             triggered_journey = TRIGGERED.pop(sender, None)
             typed_journey = session.get("journey")
             if triggered_journey:
                 journey = triggered_journey
-                logstep(f"MAP: gate-in triggered journey {journey['journey_fteid']}")
+                logstep(f"MAP: gate-in journey {journey['journey_fteid']}")
             elif typed_journey:
                 journey = typed_journey
-                logstep(f"MAP: driver-typed waybill journey {journey['journey_fteid']}")
+                logstep(f"MAP: driver-typed journey {journey['journey_fteid']}")
             else:
                 journey = find_journey(ocr.get("waybill_number"))
-                logstep(f"MAP: cold photo, matched {ocr.get('waybill_number')} -> {journey['journey_fteid'] if journey else 'NO MATCH'}")
+                logstep(f"MAP: cold, matched {ocr.get('waybill_number')} -> {journey['journey_fteid'] if journey else 'NO MATCH'}")
+
             result = run_engine(ocr, journey)
             debit = eval_debit(result["shortage"]["items"], journey["rate_card"]) if (result["verdict"] == "PENDING_L1" and journey) else None
             msg_en = verdict_message_en(result, journey, debit) if (journey or result["verdict"] != "REJECTED") \
                 else verdict_message_en(result, {"waybill_number": ocr.get("waybill_number")}, None)
             msg = translate(msg_en, lang_name)
-            img_b64 = "data:%s;base64,%s" % (ctype, base64.b64encode(image_bytes).decode())
+            # store the signed page image for the dashboard
+            sdata, sct = attachments[best]
+            img_b64 = "data:%s;base64,%s" % (sct, base64.b64encode(sdata).decode())
             wb_shown = journey["waybill_number"] if journey else ocr.get("waybill_number")
             entry.update({"waybill": wb_shown, "verdict": result["verdict"],
                           "journey": journey["journey_fteid"] if journey else None,
@@ -354,17 +422,18 @@ async def whatsapp(request: Request):
                           "invoice_value": journey["total_invoice_value"] if journey else None,
                           "debit": debit["amount"] if debit else None,
                           "reason": result["reasons"][0] if result["reasons"] else "",
+                          "pages": len(attachments), "signed_page": best + 1,
                           "image": img_b64, "source": "WhatsApp"})
             HISTORY.insert(0, entry)
-            session.pop("journey", None)  # clear typed journey after use
+            session.pop("journey", None)
             session["stage"] = "done"
-            logstep(f"VERDICT: {result['verdict']} for {wb_shown} -> replying in {lang_name}")
+            logstep(f"VERDICT: {result['verdict']} for {wb_shown} (page {best+1}/{len(attachments)}) -> {lang_name}")
             return twiml_reply(msg)
         except Exception as e:
-            logstep(f"ERROR processing photo: {type(e).__name__}: {e}")
+            logstep(f"ERROR processing media: {type(e).__name__}: {e}")
             entry.update({"verdict": "ERROR", "error": str(e)})
             HISTORY.insert(0, entry)
-            return twiml_reply(translate("⚠️ Sorry, I couldn't read that image. Please retake it clearly and send again.", lang_name))
+            return twiml_reply(translate("⚠️ Sorry, I couldn't read that document. Please retake it clearly and send again.", lang_name))
 
     # --- A language choice (1-6) ---
     if body in LANGUAGES:
