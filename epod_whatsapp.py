@@ -426,7 +426,17 @@ async def whatsapp(request: Request):
                 return twiml_reply(translate(STRINGS_EN["multi_delivery"], lang_name))
 
             # Mapping priority: gate-in trigger > driver-typed waybill > read waybill/invoice
+            # Trigger lookup is tolerant: match the exact sender, OR the configured
+            # DRIVER_NUMBER, OR (single-driver demo) any active trigger - so a slight
+            # sender-format difference from Twilio doesn't drop the gate-in.
             triggered_journey = TRIGGERED.pop(sender, None)
+            if not triggered_journey and norm(sender) == norm(DRIVER_NUMBER):
+                triggered_journey = TRIGGERED.pop(DRIVER_NUMBER, None)
+            if not triggered_journey and TRIGGERED:
+                # exactly one demo driver: consume the most recent active trigger
+                k = next(iter(TRIGGERED))
+                triggered_journey = TRIGGERED.pop(k)
+                logstep(f"MAP: matched active trigger under {k!r} for incoming {sender!r}")
             typed_journey = session.get("journey")
             if triggered_journey:
                 journey = triggered_journey
