@@ -318,11 +318,10 @@ def verdict_message_en(result, journey, debit):
                 f"Clean delivery — no damage found.\n"
                 f"Billing is now unlocked. You're all set, thank you!")
     if result["verdict"] == "PENDING_L1":
-        amt = (f"₹{debit['amount']:,.0f}" if debit and debit.get("amount") else "to be confirmed")
         return (f"⚠️ *POD RECEIVED — UNCLEAN*\n\n"
                 f"Ref: {ident}\n"
                 f"{result['reasons'][0]}\n"
-                f"This will go for L1 approval. A debit note ({amt}) may be raised. Thank you for reporting it.")
+                f"This will go for L1 approval. Thank you for reporting it.")
     return (f"❌ *POD REJECTED*\n\n{result['reasons'][0]}\n\nPlease retake and send again.")
 
 
@@ -367,12 +366,12 @@ def send_whatsapp(to, message):
 
 
 def gatein_message(journey):
-    """Safe, language-neutral gate-in prompt + language menu."""
+    """Safe, language-neutral delivery-complete prompt + language menu."""
     ident = journey.get("waybill_number") or journey.get("invoice_number") or "-"
     return (
-        f"🚚 *You have reached {journey['consignee_name']}*\n"
-        f"Delivery LR / Invoice: *{ident}*\n\n"
-        f"Please upload the *signed & stamped POD* for this delivery.\n\n"
+        f"✅ *Delivery complete at {journey['consignee_name']}*\n"
+        f"LR / Invoice: *{ident}*\n\n"
+        f"Now that unloading is done, please upload the *signed & stamped POD* for this delivery.\n\n"
         f"First, choose your language / अपनी भाषा चुनें:\n"
         f"1. English\n2. हिंदी\n3. தமிழ்\n4. ಕನ್ನಡ\n5. తెలుగు\n6. मराठी\n\n"
         f"_Reply with a number (1-6), then send the POD photo._"
@@ -642,8 +641,8 @@ transform:translateX(100%);transition:transform .25s;z-index:11;padding:26px 30p
   </div>
   <div style="margin-bottom:12px;font-size:14px;color:#5C6B7E">__COUNT__ Trips available</div>
   <div id="gatein" style="background:#fff;border:1px solid #E3E8EF;border-radius:10px;padding:16px 18px;margin-bottom:18px">
-    <div style="font-size:13px;font-weight:700;color:#2563EB;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px">🚚 Simulate Gate-In (proactive trigger)</div>
-    <div style="font-size:13px;color:#5C6B7E;margin-bottom:12px">In production this fires automatically when the truck geofences into the consignee. Click to send the driver a proactive "upload your POD" WhatsApp for that delivery.</div>
+    <div style="font-size:13px;font-weight:700;color:#2563EB;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px">✅ Simulate Delivery Complete (proactive trigger)</div>
+    <div style="font-size:13px;color:#5C6B7E;margin-bottom:12px">In production this fires automatically when unloading is complete at the consignee. Click to send the driver a proactive "upload your POD" WhatsApp for that delivery.</div>
     <div id="gbtns" style="display:flex;gap:10px;flex-wrap:wrap"></div>
     <div id="gmsg" style="font-size:13px;margin-top:10px;color:#5C6B7E"></div>
   </div>
@@ -663,10 +662,10 @@ document.getElementById('gbtns').innerHTML = JOURNEYS.map((j,i)=>
 ).join('');
 function fireGateIn(i,btn){
   const m=document.getElementById('gmsg');
-  m.textContent='Sending gate-in message to driver…'; btn.disabled=true;
+  m.textContent='Sending delivery-complete message to driver…'; btn.disabled=true;
   fetch('/gatein/'+i,{method:'POST'}).then(r=>r.text()).then(t=>{
     m.innerHTML = t==='sent'
-      ? '✅ Gate-in message sent to driver on WhatsApp. Reply there with the POD photo — it will map to <b>'+JOURNEYS[i].waybill_number+'</b>.'
+      ? '✅ Delivery-complete message sent to driver on WhatsApp. Reply there with the POD photo — it will map to <b>'+JOURNEYS[i].waybill_number+'</b>.'
       : '⚠️ '+t+' — make sure you\'ve messaged the sandbox in the last 24h.';
     btn.disabled=false;
   }).catch(e=>{m.textContent='Error: '+e;btn.disabled=false;});
