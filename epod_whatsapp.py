@@ -108,6 +108,8 @@ STRINGS_EN = {
     "invalid_pod": ("❌ This doesn't look like a valid ePOD for an open delivery.\n\n"
                     "Please submit a *clear photo of the signed & stamped POD or tax invoice* for your delivery. "
                     "Make sure the waybill / invoice number is visible."),
+    "wrong_doc": ("❌ This document doesn't match the delivery you're at (expected *{ident}*).\n\n"
+                  "Please upload the *correct signed POD / invoice* for this delivery."),
     "reading": "⏳ Reading your document, please wait…",
 }
 
@@ -436,6 +438,26 @@ async def whatsapp(request: Request):
                 journey = find_journey(ocr.get("waybill_number"), ocr.get("invoice_number"))
                 logstep(f"MAP: cold, wb={ocr.get('waybill_number')} inv={ocr.get('invoice_number')} "
                         f"-> {journey['journey_fteid'] if journey else 'NO MATCH'}")
+
+            # Gate-in / typed cross-check: we know the EXPECTED delivery, but still
+            # verify the driver didn't upload the wrong document. Tolerant by design:
+            #  - reject if it's not a valid POD at all (e.g. a weighbridge slip)
+            #  - reject if it clearly reads as a DIFFERENT known delivery
+            #  - otherwise accept (unreadable / near-match trusts the gate-in)
+            if triggered_journey or typed_journey:
+                read_journey = find_journey(ocr.get("waybill_number"), ocr.get("invoice_number"))
+                mismatch = read_journey is not None and read_journey["journey_fteid"] != journey["journey_fteid"]
+                if not ocr.get("is_valid_pod", True) or mismatch:
+                    logstep(f"{sender}: gate-in cross-check FAILED "
+                            f"(valid={ocr.get('is_valid_pod')}, read={read_journey['journey_fteid'] if read_journey else None}, "
+                            f"expected={journey['journey_fteid']})")
+                    entry.update({"waybill": journey_ident(journey), "verdict": "INVALID",
+                                  "consignee": journey["consignee_name"], "transporter": journey["transporter_name"],
+                                  "reason": f"Uploaded document does not match the expected delivery ({journey_ident(journey)}).",
+                                  "source": "WhatsApp"})
+                    HISTORY.insert(0, entry)
+                    return twiml_reply(translate(
+                        STRINGS_EN["wrong_doc"].replace("{ident}", journey_ident(journey)), lang_name))
 
             # Invalid-ePOD guard (cold path only - trigger/typed always have a journey):
             # if it's not a valid POD, or matches no open delivery, ask for a valid ePOD.
