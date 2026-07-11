@@ -43,22 +43,31 @@ def logstep(msg):
 # JOURNEY DATA
 # ============================================================================
 JOURNEYS = [
-    {"journey_fteid": "JRN-JBP-1889", "waybill_number": "6007 0471 8894",
+    {"journey_fteid": "JRN-JBP-1889", "waybill_number": "6007 0471 8894", "invoice_number": None,
      "consignor_name": "Tata Motors Ltd", "transporter_name": "Safexpress",
      "consignee_name": "Frontier Trucks Pvt Ltd (Jabalpur)", "total_invoice_value": 36335,
      "materials": [{"material_code": "M001", "description": "Auto components"}], "rate_card": {"M001": 380}},
-    {"journey_fteid": "JRN-JBP-8894", "waybill_number": "6907 0473 8894",
+    {"journey_fteid": "JRN-JBP-8894", "waybill_number": "6907 0473 8894", "invoice_number": None,
      "consignor_name": "Tata Motors Ltd", "transporter_name": "Safexpress",
      "consignee_name": "Frontier Trucks (Jabalpur)", "total_invoice_value": 36335,
      "materials": [{"material_code": "M001", "description": "Auto components"}], "rate_card": {"M001": 380}},
-    {"journey_fteid": "JRN-RJP-0354", "waybill_number": "7007 0446 0354",
+    {"journey_fteid": "JRN-RJP-0354", "waybill_number": "7007 0446 0354", "invoice_number": None,
      "consignor_name": "TML Commercial Vehicles Limited", "transporter_name": "Safexpress",
      "consignee_name": "Libra Automotors (Patiala)", "total_invoice_value": 1041,
      "materials": [{"material_code": "M001", "description": "Auto components"}], "rate_card": {"M001": 380}},
-    {"journey_fteid": "JRN-PTNA-2299", "waybill_number": "5007 0496 2299",
+    {"journey_fteid": "JRN-PTNA-2299", "waybill_number": "5007 0496 2299", "invoice_number": None,
      "consignor_name": "Tata Motors Limited", "transporter_name": "Safexpress",
      "consignee_name": "Binay Motors Private Limited (Patna)", "total_invoice_value": 76000,
      "materials": [{"material_code": "M001", "description": "Auto components"}], "rate_card": {"M001": 380}},
+    # --- JSW One invoices (matched by invoice number) ---
+    {"journey_fteid": "JRN-JSW-3544", "waybill_number": None, "invoice_number": "JODLMH0326/43544",
+     "consignor_name": "JSW One Distribution Limited", "transporter_name": "JSW One",
+     "consignee_name": "Eco-Weld Global Equipments LLP (Dehugaon)", "total_invoice_value": 2121669,
+     "materials": [{"material_code": "HRS", "description": "Mild Steel Hot Rolled Sheet"}], "rate_card": {"HRS": 57500}},
+    {"journey_fteid": "JRN-JSW-1796", "waybill_number": None, "invoice_number": "JODLMH0226/41796",
+     "consignor_name": "JSW One Distribution Limited", "transporter_name": "JSW One",
+     "consignee_name": "Nimbai Laser Work (Pune)", "total_invoice_value": 1496337,
+     "materials": [{"material_code": "CRS", "description": "Mild Steel Cold Rolled Sheet"}], "rate_card": {"CRS": 62100}},
 ]
 CRITICAL = ["waybill", "lr", "invoice", "number", "material", "signature", "stamp", "damage"]
 
@@ -96,6 +105,9 @@ STRINGS_EN = {
     "not_found": ("❌ No open delivery found for that number. Please check the waybill and type it again."),
     "multi_delivery": ("📑 It looks like you've sent paperwork for *more than one delivery* at once. "
                        "Please send *one delivery at a time* — the POD pages for a single waybill. Thank you!"),
+    "invalid_pod": ("❌ This doesn't look like a valid ePOD for an open delivery.\n\n"
+                    "Please submit a *clear photo of the signed & stamped POD or tax invoice* for your delivery. "
+                    "Make sure the waybill / invoice number is visible."),
     "reading": "⏳ Reading your document, please wait…",
 }
 
@@ -123,13 +135,27 @@ DRIVER_NUMBER = os.environ.get("DRIVER_NUMBER", "whatsapp:+919110844592")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
 
 
+def journey_ident(journey):
+    """Display identifier: waybill number if present, else invoice number."""
+    if not journey:
+        return "-"
+    return journey.get("waybill_number") or journey.get("invoice_number") or "-"
+
+
 def norm(v):
     return "" if v is None else "".join(c for c in str(v).upper() if c.isalnum())
 
 
-def find_journey(wb):
-    n = norm(wb)
-    return next((j for j in JOURNEYS if norm(j["waybill_number"]) == n), None)
+def find_journey(wb, inv=None):
+    """Match a journey by waybill number OR invoice number (either identifier)."""
+    nwb = norm(wb)
+    ninv = norm(inv)
+    for j in JOURNEYS:
+        if nwb and j.get("waybill_number") and norm(j["waybill_number"]) == nwb:
+            return j
+        if ninv and j.get("invoice_number") and norm(j["invoice_number"]) == ninv:
+            return j
+    return None
 
 
 # ============================================================================
@@ -192,10 +218,13 @@ DAMAGE/SHORTAGE: damage_or_shortage=true only if there's a handwritten/printed n
 VISION_PROMPT_MULTI = """You are validating a Proof of Delivery submission. It may be a single image, MULTIPLE images, or a PDF with several pages. The items are given IN ORDER (index 0, 1, 2, ...). Together they are ONE delivery's paperwork (e.g. front/back or multiple pages of the same waybill).
 
 Look across ALL pages/images and return ONLY JSON:
-{"waybill_number": string|null, "waybill_confidence": number, "signed_page_index": integer, "legible": boolean, "illegible_fields": string[], "damage_or_shortage": boolean, "damage_notes": string[], "shortage_items": [{"material_code": string, "shortage_qty": number}], "signature_present": boolean, "stamp_present": boolean, "multiple_deliveries": boolean}
+{"waybill_number": string|null, "invoice_number": string|null, "waybill_confidence": number, "signed_page_index": integer, "legible": boolean, "illegible_fields": string[], "damage_or_shortage": boolean, "damage_notes": string[], "shortage_items": [{"material_code": string, "shortage_qty": number}], "signature_present": boolean, "stamp_present": boolean, "multiple_deliveries": boolean, "is_valid_pod": boolean}
 
-"signed_page_index": the 0-based index of the page/image that best shows the signed & stamped waybill (the one to display as proof). If only one item, use 0.
-"multiple_deliveries": true ONLY if the pages clearly show DIFFERENT waybill numbers for DIFFERENT deliveries (a batch of separate PODs), false if they're all the same delivery.
+"waybill_number": a 12-digit transporter waybill (4-4-4 format like "6007 0471 8894") if present, else null.
+"invoice_number": the tax-invoice / document number if present (e.g. "JODLMH0326/43544"), else null. Look near labels like "Invoice No." / "Invoice Number".
+"is_valid_pod": true if this looks like a genuine delivery proof (a waybill or a tax invoice, ideally with a signature/stamp). false if it is something else (a random photo, a weighbridge slip, an unrelated document, or unreadable).
+"signed_page_index": 0-based index of the page/image best showing the signed & stamped document. If one item, use 0.
+"multiple_deliveries": true ONLY if pages show DIFFERENT waybill/invoice numbers for DIFFERENT deliveries.
 
 READING THE WAYBILL NUMBER (be careful):
 - 12 digits formatted 4-4-4, like "6007 0471 8894". It appears near a "Waybill No." box and as digits under the barcode - the barcode digits are cleanest, prefer them. Cross-check both copies.
@@ -210,7 +239,7 @@ def extract_with_openai(image_bytes, mtype):
     b64 = base64.b64encode(image_bytes).decode()
     res = requests.post("https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {_openai_key()}", "Content-Type": "application/json"},
-        json={"model": "gpt-4o", "max_tokens": 1000, "messages": [{"role": "user", "content": [
+        json={"model": "gpt-4o", "max_tokens": 1000, "temperature": 0, "response_format": {"type": "json_object"}, "messages": [{"role": "user", "content": [
             {"type": "text", "text": VISION_PROMPT},
             {"type": "image_url", "image_url": {"url": f"data:{mtype};base64,{b64}"}}]}]}, timeout=60)
     if res.status_code != 200:
@@ -240,7 +269,7 @@ def extract_multi(attachments):
             content.append({"type": "image_url", "image_url": {"url": f"data:{ct};base64,{b64}"}})
     res = requests.post("https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {_openai_key()}", "Content-Type": "application/json"},
-        json={"model": "gpt-4o", "max_tokens": 1200, "messages": [{"role": "user", "content": content}]},
+        json={"model": "gpt-4o", "max_tokens": 1200, "temperature": 0, "response_format": {"type": "json_object"}, "messages": [{"role": "user", "content": content}]},
         timeout=120)
     if res.status_code != 200:
         logstep(f"OCR ERROR: OpenAI returned {res.status_code}: {res.text[:300]}")
@@ -279,16 +308,17 @@ def translate(text, lang_name):
 # Verdict message (English base)
 # ============================================================================
 def verdict_message_en(result, journey, debit):
+    ident = journey_ident(journey)
     if result["verdict"] == "AUTO_APPROVED":
         return (f"✅ *POD ACCEPTED*\n\n"
-                f"Waybill: {journey['waybill_number']}\n"
+                f"Ref: {ident}\n"
                 f"Consignee: {journey['consignee_name']}\n"
                 f"Clean delivery — no damage found.\n"
                 f"Billing is now unlocked. You're all set, thank you!")
     if result["verdict"] == "PENDING_L1":
         amt = (f"₹{debit['amount']:,.0f}" if debit and debit.get("amount") else "to be confirmed")
         return (f"⚠️ *POD RECEIVED — UNCLEAN*\n\n"
-                f"Waybill: {journey['waybill_number']}\n"
+                f"Ref: {ident}\n"
                 f"{result['reasons'][0]}\n"
                 f"This will go for L1 approval. A debit note ({amt}) may be raised. Thank you for reporting it.")
     return (f"❌ *POD REJECTED*\n\n{result['reasons'][0]}\n\nPlease retake and send again.")
@@ -336,9 +366,10 @@ def send_whatsapp(to, message):
 
 def gatein_message(journey):
     """Safe, language-neutral gate-in prompt + language menu."""
+    ident = journey.get("waybill_number") or journey.get("invoice_number") or "-"
     return (
         f"🚚 *You have reached {journey['consignee_name']}*\n"
-        f"Delivery LR / Waybill: *{journey['waybill_number']}*\n\n"
+        f"Delivery LR / Invoice: *{ident}*\n\n"
         f"Please upload the *signed & stamped POD* for this delivery.\n\n"
         f"First, choose your language / अपनी भाषा चुनें:\n"
         f"1. English\n2. हिंदी\n3. தமிழ்\n4. ಕನ್ನಡ\n5. తెలుగు\n6. मराठी\n\n"
@@ -392,7 +423,7 @@ async def whatsapp(request: Request):
                 logstep(f"{sender}: multiple_deliveries flagged -> asking one at a time")
                 return twiml_reply(translate(STRINGS_EN["multi_delivery"], lang_name))
 
-            # Mapping priority: gate-in trigger > driver-typed waybill > image-read waybill
+            # Mapping priority: gate-in trigger > driver-typed waybill > read waybill/invoice
             triggered_journey = TRIGGERED.pop(sender, None)
             typed_journey = session.get("journey")
             if triggered_journey:
@@ -402,8 +433,20 @@ async def whatsapp(request: Request):
                 journey = typed_journey
                 logstep(f"MAP: driver-typed journey {journey['journey_fteid']}")
             else:
-                journey = find_journey(ocr.get("waybill_number"))
-                logstep(f"MAP: cold, matched {ocr.get('waybill_number')} -> {journey['journey_fteid'] if journey else 'NO MATCH'}")
+                journey = find_journey(ocr.get("waybill_number"), ocr.get("invoice_number"))
+                logstep(f"MAP: cold, wb={ocr.get('waybill_number')} inv={ocr.get('invoice_number')} "
+                        f"-> {journey['journey_fteid'] if journey else 'NO MATCH'}")
+
+            # Invalid-ePOD guard (cold path only - trigger/typed always have a journey):
+            # if it's not a valid POD, or matches no open delivery, ask for a valid ePOD.
+            if not triggered_journey and not typed_journey:
+                if not ocr.get("is_valid_pod", True) or journey is None:
+                    logstep(f"{sender}: invalid/unmatched ePOD (valid={ocr.get('is_valid_pod')}, matched={journey is not None})")
+                    entry.update({"waybill": ocr.get("waybill_number") or ocr.get("invoice_number") or "-",
+                                  "verdict": "INVALID", "reason": "Not a valid ePOD or no matching open delivery.",
+                                  "source": "WhatsApp"})
+                    HISTORY.insert(0, entry)
+                    return twiml_reply(translate(STRINGS_EN["invalid_pod"], lang_name))
 
             result = run_engine(ocr, journey)
             debit = eval_debit(result["shortage"]["items"], journey["rate_card"]) if (result["verdict"] == "PENDING_L1" and journey) else None
@@ -413,7 +456,7 @@ async def whatsapp(request: Request):
             # store the signed page image for the dashboard
             sdata, sct = attachments[best]
             img_b64 = "data:%s;base64,%s" % (sct, base64.b64encode(sdata).decode())
-            wb_shown = journey["waybill_number"] if journey else ocr.get("waybill_number")
+            wb_shown = journey_ident(journey) if journey else (ocr.get("waybill_number") or ocr.get("invoice_number"))
             entry.update({"waybill": wb_shown, "verdict": result["verdict"],
                           "journey": journey["journey_fteid"] if journey else None,
                           "consignor": journey["consignor_name"] if journey else "-",
@@ -438,27 +481,10 @@ async def whatsapp(request: Request):
     # --- A language choice (1-6) ---
     if body in LANGUAGES:
         eng_name, native = LANGUAGES[body]
-        # if a gate-in trigger is active, we already know the delivery -> ask for photo
-        if has_trigger:
-            SESSIONS[sender] = {"lang": body, "lang_name": eng_name, "stage": "await_photo"}
-            logstep(f"{sender}: language {eng_name}, gate-in active -> ask photo")
-            return twiml_reply(translate(STRINGS_EN["ask_photo"], eng_name))
-        # cold / driver-initiated -> ask for the waybill number
-        SESSIONS[sender] = {"lang": body, "lang_name": eng_name, "stage": "await_waybill"}
-        logstep(f"{sender}: language {eng_name}, cold flow -> ask waybill")
-        return twiml_reply(translate(STRINGS_EN["ask_waybill"], eng_name))
-
-    # --- Driver is typing the waybill number (cold flow) ---
-    if session and session.get("stage") == "await_waybill":
-        lang_name = session["lang_name"]
-        journey = find_journey(body)
-        if not journey:
-            logstep(f"{sender}: typed waybill {body!r} -> no match")
-            return twiml_reply(translate(STRINGS_EN["not_found"], lang_name))
-        session["journey"] = journey
-        session["stage"] = "await_photo"
-        logstep(f"{sender}: typed waybill matched {journey['journey_fteid']} -> confirm + ask photo")
-        return twiml_reply(translate(confirm_message_en(journey), lang_name))
+        # both gate-in and driver-initiated now go straight to asking for the photo
+        SESSIONS[sender] = {"lang": body, "lang_name": eng_name, "stage": "await_photo"}
+        logstep(f"{sender}: language {eng_name} -> ask photo")
+        return twiml_reply(translate(STRINGS_EN["ask_photo"], eng_name))
 
     # --- Anything else -> welcome/menu ---
     logstep(f"{sender}: showing welcome menu")
@@ -512,7 +538,8 @@ def home():
     n_unclean = sum(1 for r in rows if r.get("verdict") == "PENDING_L1")
 
     data_json = _json.dumps(rows)
-    journeys_json = _json.dumps([{"consignee_name": j["consignee_name"], "waybill_number": j["waybill_number"]} for j in JOURNEYS])
+    journeys_json = _json.dumps([{"consignee_name": j["consignee_name"],
+                                  "waybill_number": j.get("waybill_number") or j.get("invoice_number") or "-"} for j in JOURNEYS])
     return DASHBOARD_HTML.replace("__ROWS__", data_json).replace("__JOURNEYS__", journeys_json)\
         .replace("__PENDING__", str(n_pending)).replace("__SUBMITTED__", str(n_submitted))\
         .replace("__REJECTED__", str(n_rejected)).replace("__APPROVED__", str(n_approved))\
